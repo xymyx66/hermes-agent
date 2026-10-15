@@ -109,36 +109,8 @@ _PROFILE_NAME_TTL = 300.0
 _MAX_INBOUND_ATTACHMENTS = 4
 _MAX_INBOUND_ATTACHMENT_BYTES = 20 * 1024 * 1024
 _ATTACHMENT_DOWNLOAD_TIMEOUT = 30.0
-_MAX_ATTACHMENT_FILENAME_BYTES = 120
 
-
-def _safe_attachment_filename(value: str) -> str:
-    """Return a basename that is safe for cache files and agent context."""
-    name = str(value or "").replace("\\", "/").rsplit("/", 1)[-1]
-    name = "".join(c for c in name if ord(c) >= 32 and c != "\x7f").strip()
-    if name in {"", ".", ".."}:
-        return "attachment.bin"
-    suffix = Path(name).suffix if len(Path(name).suffix.encode("utf-8")) <= 20 else ""
-    stem = name[:-len(suffix)] if suffix else name
-    byte_budget = _MAX_ATTACHMENT_FILENAME_BYTES - len(suffix.encode("utf-8"))
-    safe_stem = stem.encode("utf-8")[:byte_budget].decode("utf-8", errors="ignore").rstrip(" .")
-    return f"{safe_stem or 'attachment'}{suffix}"
-
-
-def _attachment_origin(value: str) -> Optional[tuple[str, int]]:
-    """Normalize a configured host/URL to an exact HTTPS-equivalent origin."""
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    try:
-        parsed = urlsplit(raw if "://" in raw else f"//{raw}")
-        host = (parsed.hostname or "").lower().rstrip(".")
-        port = parsed.port or 443
-    except ValueError:
-        return None
-    if (parsed.scheme and parsed.scheme not in {"https", "wss"}) or not host:
-        return None
-    return host, port
+# Attachment/media helpers live in the sibling adapter_media.py (this file sits at its code-health line cap).
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 _WS_AUTH_TIMEOUT = 20.0
@@ -147,18 +119,16 @@ _WS_AUTH_TIMEOUT = 20.0
 # close the transport never surfaces (observed as a CLOSE_WAIT socket with the loop parked on recv, #98097)
 # leaves the gateway "connected" while inbound stops; this timeout forces the normal reconnect path instead.
 _WS_READ_IDLE_TIMEOUT = 300.0
+_MIN_WS_IDLE_TIMEOUT = 30.0
+# Grace given to the idle-bound probe before the socket is declared silent. A healthy relay answers one cheap
+# `limit: 0` REQ in milliseconds, so this only bounds the pathological case.
+_WS_IDLE_PROBE_GRACE = 10.0
+_WS_IDLE_PROBE_SUB_ID = "hermes-buzz-idle-probe"
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100  # Buzz channel-membership event — live DM discovery
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 # Credentials JSON fallback when BUZZ_PRIVATE_KEY is not set; module-level so tests can point it at a tmpdir.
 _DEFAULT_CREDENTIALS_DIR = Path("~/.config/buzz").expanduser()
-# Buzz-hosted media is private to the community: same-relay URLs must be authenticated + localised for vision.
-_MEDIA_URL_PATTERN = r"https?://[^\s<>\[\]()]+/media/[0-9a-f]{64}(?:\.[a-z0-9]{1,10})?(?:\?[^\s<>\[\]()]*)?"
-_MARKDOWN_MEDIA_RE = re.compile(
-    rf"!\[(?P<alt>[^\]]*)\]\(\s*(?P<url>{_MEDIA_URL_PATTERN})(?:\s+[\"'][^\"']*[\"'])?\s*\)", re.IGNORECASE
-)
-_BARE_MEDIA_RE = re.compile(_MEDIA_URL_PATTERN, re.IGNORECASE)
-_MEDIA_PATH_RE = re.compile(r"^/media/(?P<sha>[0-9a-f]{64})(?P<ext>\.[a-z0-9]{1,10})?/?$", re.IGNORECASE)
 
 
 def _consume_ws_read_task(task: asyncio.Task) -> None:
@@ -166,56 +136,6 @@ def _consume_ws_read_task(task: asyncio.Task) -> None:
     if not task.cancelled():
         with contextlib.suppress(Exception):
             task.exception()
-
-
-def _effective_port(parsed) -> Optional[int]:
-    try:
-        if parsed.port is not None:
-            return parsed.port
-    except ValueError:
-        return None
-    return {"https": 443, "wss": 443, "http": 80, "ws": 80}.get(parsed.scheme)
-
-
-def _is_relay_media_url(url: str, relay_url: str) -> bool:
-    """Return whether *url* is a Buzz media object on the configured relay."""
-    candidate, relay = urlsplit(url), urlsplit(relay_url)
-    return bool(
-        candidate.scheme in ("http", "https") and candidate.hostname and relay.hostname
-        and candidate.hostname.lower() == relay.hostname.lower()
-        and _effective_port(candidate) == _effective_port(relay) and _MEDIA_PATH_RE.fullmatch(candidate.path)
-    )
-
-
-def _find_relay_media_refs(text: str, relay_url: str) -> tuple[list[str], list[tuple[int, int, str]]]:
-    """Find same-relay media URLs and their safe text replacements."""
-    urls: list[str] = []
-    replacements: list[tuple[int, int, str]] = []
-    markdown_spans: list[tuple[int, int]] = []
-    for match in _MARKDOWN_MEDIA_RE.finditer(text):
-        url = match.group("url")
-        if not _is_relay_media_url(url, relay_url):
-            continue
-        markdown_spans.append(match.span())
-        replacements.append((*match.span(), match.group("alt").strip()))
-        if url not in urls:
-            urls.append(url)
-    for match in _BARE_MEDIA_RE.finditer(text):
-        if any(start <= match.start() and match.end() <= end for start, end in markdown_spans):
-            continue
-        url = match.group(0)
-        if not _is_relay_media_url(url, relay_url):
-            continue
-        replacements.append((*match.span(), ""))
-        if url not in urls:
-            urls.append(url)
-    return urls, replacements
-
-
-def _replace_media_refs(text: str, replacements: list[tuple[int, int, str]]) -> str:
-    for start, end, replacement in sorted(replacements, reverse=True):
-        text = f"{text[:start]}{replacement}{text[end:]}"
-    return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+\n", "\n", text)).strip()
 
 
 def _load_nostr_auth():
@@ -234,6 +154,24 @@ def _load_nostr_auth():
 
 
 _nostr_auth = _load_nostr_auth()
+
+
+def _load_adapter_media():
+    """Import the sibling media helpers loader-agnostically (the test loader imports this file as a bare module)."""
+    try:
+        from . import adapter_media  # type: ignore[no-redef]
+        return adapter_media
+    except ImportError:
+        import importlib.util
+        path = Path(__file__).with_name("adapter_media.py")
+        spec = importlib.util.spec_from_file_location("plugin_adapter_buzz_media", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+
+_media = _load_adapter_media()
 
 # bech32 (BIP-173) npub <-> hex so mention detection and allow-lists accept either form.
 from gateway.authz_mixin import (
@@ -515,9 +453,9 @@ class BuzzAdapter(BasePlatformAdapter):
         # Env overrides config.yaml, except under a secondary profile scope where extra wins (_scoped_platform_setting).
         self.relay_url = _configured_relay(extra)
         hosts = _split_csv(extra.get("attachment_hosts", []))
-        origins = (_attachment_origin(h) for h in hosts if isinstance(h, str))
+        origins = (_media._attachment_origin(h) for h in hosts if isinstance(h, str))
         self._attachment_origins = {o for o in origins if o is not None}
-        relay_origin = _attachment_origin(self.relay_url)
+        relay_origin = _media._attachment_origin(self.relay_url)
         if relay_origin is not None:
             self._attachment_origins.add(relay_origin)
         self.cli_path = _configured_cli_path(extra)
@@ -530,6 +468,15 @@ class BuzzAdapter(BasePlatformAdapter):
             self.poll_interval = max(_MIN_POLL_INTERVAL, float(_pi_raw or extra.get("poll_interval", _DEFAULT_POLL_INTERVAL)))
         except (TypeError, ValueError):
             self.poll_interval = max(_MIN_POLL_INTERVAL, _DEFAULT_POLL_INTERVAL)
+        # Silent-relay read bound (seconds). The WebSocket read loop only sees data frames, so a room with no
+        # inbound traffic trips the bound on schedule; _probe_idle_relay answers that before reconnecting.
+        _wi_raw = _scoped_platform_setting("BUZZ_WS_IDLE_TIMEOUT", extra, "ws_idle_timeout")
+        try:
+            self.ws_idle_timeout = max(_MIN_WS_IDLE_TIMEOUT, float(_wi_raw or extra.get("ws_idle_timeout", _WS_READ_IDLE_TIMEOUT)))
+        except (TypeError, ValueError):
+            self.ws_idle_timeout = _WS_READ_IDLE_TIMEOUT
+        # Count of idle bounds answered by a probe (socket proven alive while the relay stayed quiet).
+        self.idle_probe_keeps = 0
         # Channel messages must @mention the agent unless disabled; DMs always dispatch.
         _rm_cfg = _setting_or("BUZZ_REQUIRE_MENTION", extra, "require_mention", True)
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
@@ -1144,6 +1091,41 @@ class BuzzAdapter(BasePlatformAdapter):
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
+    async def _probe_idle_relay(self, websocket, read_task: asyncio.Future) -> bool:
+        """Answer an idle bound with one cheap REQ before declaring a quiet socket dead.
+
+        Protocol-level ping/pong (ping_interval/ping_timeout) keeps the transport honest but is invisible to
+        ``async for``, so a relay with nothing to say looks exactly like the CLOSE_WAIT case in #98097 — this
+        probe tells them apart. Any frame answers (the probe's own EOSE counts as proof the socket still
+        reads); the probe subscription is closed on the way out so a long-lived gateway never accumulates
+        subscriptions. Reads through ``read_task`` — the read already parked on the iterator stays the only
+        consumer of it.
+        """
+        from websockets.exceptions import ConnectionClosed
+
+        probe_filter: dict[str, Any] = {"limit": 0}
+        if self._self_pubkey:
+            probe_filter = {"kinds": [_WS_MEMBERSHIP_KIND], "#p": [self._self_pubkey], "limit": 0}
+        try:
+            await self._send_req(websocket, _WS_IDLE_PROBE_SUB_ID, probe_filter)
+            done, _ = await asyncio.wait({read_task}, timeout=_WS_IDLE_PROBE_GRACE, return_when=asyncio.FIRST_COMPLETED)
+        except (ConnectionClosed, OSError) as exc:
+            # A socket that cannot carry the probe is the case the idle bound exists for: reconnect.
+            logger.debug("Buzz: idle probe could not be sent (%s)", exc)
+            return False
+        try:
+            await websocket.send(json.dumps(["CLOSE", _WS_IDLE_PROBE_SUB_ID], separators=(",", ":")))
+        except (ConnectionClosed, OSError) as exc:
+            # About to be reconnected anyway; the reconnect path reports it.
+            logger.debug("Buzz: idle probe CLOSE not delivered (%s)", exc)
+        if not done:
+            return False
+        self.idle_probe_keeps += 1
+        if self.idle_probe_keeps == 1:
+            logger.info("Buzz: quiet relay answered the idle probe — staying connected (further keeps at debug)")
+        logger.debug("Buzz: idle probe keep #%d", self.idle_probe_keeps)
+        return True
+
     async def _ws_read_loop(self, websocket, subscriptions: dict[str, Optional[str]]) -> None:
         """Read frames until the relay closes; a close or an idle read raises ConnectionError to reconnect."""
         frame_iter = websocket.__aiter__()
@@ -1151,14 +1133,15 @@ class BuzzAdapter(BasePlatformAdapter):
             read_task = asyncio.ensure_future(frame_iter.__anext__())
             try:
                 done, _ = await asyncio.wait(
-                    {read_task}, timeout=_WS_READ_IDLE_TIMEOUT, return_when=asyncio.FIRST_COMPLETED
+                    {read_task}, timeout=self.ws_idle_timeout, return_when=asyncio.FIRST_COMPLETED
                 )
-                if not done:
+                if not done and not await self._probe_idle_relay(websocket, read_task):
                     # wait_for() cancels and then waits for its awaitable to acknowledge the cancellation.
                     # A transport receive stuck below asyncio can ignore that cancellation forever, leaving the
                     # adapter healthy-looking. Detach the read instead so the outer loop can close and reconnect.
                     raise ConnectionError(
-                        f"no WebSocket frame for {_WS_READ_IDLE_TIMEOUT:.0f}s; assuming the connection went silent"
+                        f"no WebSocket frame for {self.ws_idle_timeout:.0f}s and the relay did not answer a probe; "
+                        "assuming the connection went silent"
                     )
                 raw = read_task.result()
             except StopAsyncIteration:
@@ -1195,6 +1178,8 @@ class BuzzAdapter(BasePlatformAdapter):
         elif message[0] == "CLOSED":
             detail = message[-1] if len(message) > 2 else "subscription closed"
             sub_id = str(message[1]) if len(message) > 1 else ""
+            if sub_id == _WS_IDLE_PROBE_SUB_ID:
+                return  # Our own idle probe's CLOSE acknowledgement — not a channel rejection.
             closed_channel = subscriptions.get(sub_id)
             # A membership rejection is permanent — drop the channel instead of reconnect-looping.
             rejected = any(m in str(detail).lower() for m in ("restricted", "not a channel member", "auth-required"))
@@ -1433,7 +1418,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 continue
             total_declared_bytes += size
             attachments.append({"url": url, "sha256": digest, "size": size,
-                                "filename": _safe_attachment_filename(fields.get("filename", "")), "mime_type": fields.get("m", "")[:255]})
+                                "filename": _media._safe_attachment_filename(fields.get("filename", "")), "mime_type": fields.get("m", "")[:255]})
         return attachments, rejected
 
     @staticmethod
@@ -1727,20 +1712,20 @@ class BuzzAdapter(BasePlatformAdapter):
     ) -> tuple[str, list[str], list[str], MessageType]:
         """Authenticate and cache same-relay media refs in *text* (failures skipped per object). Spends our
         credentials on a sender-chosen URL, so it runs only on the gateway's explicit ``True``."""
-        urls, replacements = _find_relay_media_refs(text, self.relay_url)
+        urls, replacements = _media._find_relay_media_refs(text, self.relay_url)
         if not urls:
             return text, [], [], MessageType.TEXT
         if self._is_sender_authorized(user_id, chat_type, chat_id) is not True:
             logger.warning("Buzz: not localizing %d media reference(s) in message %s — sender %s… is not explicitly authorized",
                            len(urls), message_id[:12], (user_id or "?")[:8])
             return text, [], [], MessageType.TEXT
-        cleaned_text = _replace_media_refs(text, replacements)
+        cleaned_text = _media._replace_media_refs(text, replacements)
         media_urls: list[str] = []
         media_types: list[str] = []
         media_kinds: list[str] = []
         from gateway.platforms.base import cache_media_bytes_async, validate_inbound_media_size
         for url in urls:
-            path_match = _MEDIA_PATH_RE.fullmatch(urlsplit(url).path)
+            path_match = _media._MEDIA_PATH_RE.fullmatch(urlsplit(url).path)
             if path_match is None:
                 continue
             label = f"{path_match.group('sha')[:12]}{(path_match.group('ext') or '.bin').lower()}"
@@ -1872,7 +1857,7 @@ def is_connected(config) -> bool:
 _YAML_BRIDGE = (  # (extra key, env var, kind) for apply_yaml_bridge
     ("relay_url", "BUZZ_RELAY_URL", "str"), ("cli_path", "BUZZ_CLI_PATH", "str"),
     ("home_channel", "BUZZ_HOME_CHANNEL", "str"), ("transport", "BUZZ_TRANSPORT", "str"),
-    ("poll_interval", "BUZZ_POLL_INTERVAL", "str"),
+    ("poll_interval", "BUZZ_POLL_INTERVAL", "str"), ("ws_idle_timeout", "BUZZ_WS_IDLE_TIMEOUT", "str"),
     ("channels", "BUZZ_CHANNELS", "csv"), ("allowed_users", "BUZZ_ALLOWED_USERS", "csv"),
     ("reaction_only_users", "BUZZ_REACTION_ONLY_USERS", "csv"), ("allow_all_users", "BUZZ_ALLOW_ALL_USERS", "lower"),
     ("require_mention", "BUZZ_REQUIRE_MENTION", "lower"), ("reply_in_thread", "BUZZ_REPLY_IN_THREAD", "lower"),
@@ -1901,7 +1886,8 @@ def _env_enablement() -> Optional[dict]:
         return None
     seed = _seed_extra_from_env((
         ("BUZZ_CHANNELS", "channels", lambda v: [c.strip() for c in v.split(",") if c.strip()]),
-        ("BUZZ_POLL_INTERVAL", "poll_interval", float), ("BUZZ_CLI_PATH", "cli_path", None),
+        ("BUZZ_POLL_INTERVAL", "poll_interval", float), ("BUZZ_WS_IDLE_TIMEOUT", "ws_idle_timeout", float),
+        ("BUZZ_CLI_PATH", "cli_path", None),
     ))
     home = _seed_extra_from_env((), home_env="BUZZ_HOME_CHANNEL", home_default=(seed.get("channels") or [""])[0])
     return {"relay_url": relay, **seed, **home}

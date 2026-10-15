@@ -50,6 +50,10 @@ optional_env:
     description: "Seconds between inbound poll sweeps (default: 4)"
     prompt: "Poll interval seconds"
     password: false
+  - name: BUZZ_WS_IDLE_TIMEOUT
+    description: "Seconds of relay silence before the WebSocket idle probe, then reconnect if unanswered (default: 300)"
+    prompt: "WebSocket idle timeout seconds"
+    password: false
   - name: BUZZ_CLI_PATH
     description: "Path to the buzz CLI binary (default: 'buzz' on PATH, then ~/bin/buzz)"
     prompt: "buzz CLI path (or empty)"
